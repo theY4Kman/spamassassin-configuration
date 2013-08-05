@@ -6,9 +6,11 @@ class SAType {
     const UNKNOWN = 0;
     const WHITELIST_FROM = 1;
     const BLACKLIST_FROM = 2;
+    const WHITELIST_FROM_RCVD = 3;
 
     private static $name_types = array(
         'whitelist_from' => self::WHITELIST_FROM,
+        'whitelist_from_rcvd' => self::WHITELIST_FROM_RCVD,
         'blacklist_from' => self::BLACKLIST_FROM,
     );
 
@@ -27,6 +29,7 @@ class SpamassassinConfigurationLine {
     public $rule;
     public $args;
     public $comment;
+    public $type;
 
     /**
      * @param $raw string   The line before processing
@@ -36,16 +39,16 @@ class SpamassassinConfigurationLine {
      */
     public function __construct($raw, $rule, $args, $comment) {
         $this->raw = $raw;
-        $this->rule = $rule;
-        $this->type = SAType::get_type($this->rule);
+        $this->set_rule($rule);
         $this->args = $args;
         $this->comment = $comment;
+        $this->deleted = false;
     }
 
     public function render() {
         if (!$this->rule)
             // ?: is shorthand for TEST ? TEST : DEFAULT
-            return $this->comment ?: '';
+        return $this->comment ?: '';
 
         $line = $this->rule . ($this->args ? ' ' . $this->args : '');
         if ($this->comment)
@@ -57,6 +60,15 @@ class SpamassassinConfigurationLine {
     public function get_key() {
         // I wish this was smaller, but it should
         return md5($this->raw);
+    }
+
+    public function set_rule($rule) {
+        $this->rule = $rule;
+        $this->type = SAType::get_type($this->rule);
+    }
+
+    public function delete() {
+        $this->deleted = true;
     }
 }
 
@@ -94,11 +106,13 @@ class SpamassassinConfiguration {
             if ($cf_line === null)
                 continue;
 
+            $key = $cf_line->get_key();
+            $this->keyed[$key] = $cf_line;
             $this->lines[] = $cf_line;
-            $this->keyed[$cf_line->get_key()] = $cf_line;
 
             switch ($cf_line->type) {
                 case SAType::WHITELIST_FROM:
+                case SAType::WHITELIST_FROM_RCVD:
                     $this->whitelisted[] = $cf_line;
                     $this->last_whitelisted = $line_idx;
                     break;
@@ -136,9 +150,7 @@ class SpamassassinConfiguration {
             break;
         }
 
-        // FYI, explode's limit is on the resulting array, not the number of
-        // split operations
-        $split = explode(' ', $line, 2);
+        $split = preg_split('/\s+/', $line, 2);
         $len = count($split);
 
         if ($len > 0) {
@@ -153,7 +165,8 @@ class SpamassassinConfiguration {
     public function get_config() {
         $out = array();
         foreach ($this->lines as $cf_line)
-            $out[] = $cf_line->render();
+            if (!$cf_line->deleted)
+                $out[] = $cf_line->render();
         return implode("\n", $out);
     }
 
@@ -182,6 +195,7 @@ class SpamassassinConfiguration {
         if (($cf_line = $this->get_line($line_key)) === null) {
             $cf_line = $this->parse_line('blacklist_from ' . $pattern);
             $this->add_line($cf_line, $this->last_blacklisted !== null ? ++$this->last_blacklisted : -1);
+            $this->blacklisted[] = $cf_line;
         } else {
             // Should really remove old lines from $keyed. Doesn't really
             // matter in my use case, though.
@@ -196,19 +210,23 @@ class SpamassassinConfiguration {
     public function get_blacklisted() {
         $blacklisted = array();
         foreach ($this->blacklisted as $cf_line)
-            $blacklisted[] = array($cf_line->get_key(), $cf_line->args);
+            if (!$cf_line->deleted)
+                $blacklisted[] = array($cf_line->get_key(), $cf_line->args);
         return $blacklisted;
     }
 
-    // Yeah, this was straight copy-pasted. Can't be arsed to do better in PHP.
-    public function add_whitelisted($pattern, $line_key=null) {
+    public function add_whitelisted($pattern, $rdns=null, $line_key=null) {
+        $rule = $rdns ? 'whitelist_from_rcvd' : 'whitelist_from';
+        $args = $pattern . ($rdns ? ' ' . $rdns : '');
         if (($cf_line = $this->get_line($line_key)) === null) {
-            $cf_line = $this->parse_line('whitelist_from ' . $pattern);
+            $cf_line = $this->parse_line($rule . ' ' . $args);
             $this->add_line($cf_line, $this->last_whitelisted !== null ? ++$this->last_whitelisted : -1);
+            $this->whitelisted[] = $cf_line;
         } else {
+            $cf_line->set_rule($rule);
             // Should really remove old lines from $keyed. Doesn't really
             // matter in my use case, though.
-            $cf_line->args = $pattern;
+            $cf_line->args = $args;
         }
 
         $key = $cf_line->get_key();
@@ -219,7 +237,12 @@ class SpamassassinConfiguration {
     public function get_whitelisted() {
         $whitelisted = array();
         foreach ($this->whitelisted as $cf_line)
-            $whitelisted[] = array($cf_line->get_key(), $cf_line->args);
+            if (!$cf_line->deleted)
+                $whitelisted[] = array($cf_line->get_key(), $cf_line->args);
         return $whitelisted;
+    }
+
+    public function remove_line($key) {
+        $this->keyed[$key]->delete();
     }
 }
